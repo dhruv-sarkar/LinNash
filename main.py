@@ -4,6 +4,9 @@ from scipy.spatial import ConvexHull
 from scipy.optimize import linprog
 import math
 import warnings
+import matplotlib.pyplot as plt
+import random
+from tqdm import tqdm
 
 # Suppress CVXPY UserWarning about solving a problem with a non-DCP objective
 warnings.filterwarnings("ignore", category=UserWarning)
@@ -321,72 +324,55 @@ class LinNash:
             T_prime *= 2
 
         return history
+    
+
+def simulate_linnash(env, X, T, num_trials=10, sigma2=1.0, regret_type="Nash"):
+    mu_star = np.max(env.mean_rewards)
+    total_rewards = []
+    for _ in tqdm(range(num_trials), desc="LINNASH Trials"):
+        algo = LinNash(X, T, nu=1)
+        history = algo.run(env)
+        rewards = env.mean_rewards[history]
+        total_rewards.append(rewards)
+
+    total_rewards = np.array(total_rewards)
+    expected_means = np.mean(total_rewards, axis=0)
+
+    if regret_type == "Nash":
+        cumsum_log = np.cumsum(np.log(expected_means))
+        inv_t = 1.0 / np.arange(1, T+1)
+        geom_mean = np.exp(cumsum_log * inv_t)
+        avg_regret = mu_star - geom_mean
+        return avg_regret
+    else:
+        cum_rewards = np.cumsum(expected_means)
+        inv_t = 1.0 / np.arange(1, T+1)
+        arith_mean = cum_rewards * inv_t
+        avg_regret = mu_star - arith_mean
+        return avg_regret
+
+
 
 if __name__ == '__main__':
-    # --- Experimental Setup ---
-    # This setup is inspired by the paper's experiments section.
-    d = 10         # Ambient dimension
-    num_arms = 100 # Number of arms
-    T = 20000      # Time horizon
+    # Small sanity run (reduce T for quick run)
+    d = 10
+    num_arms = 50
+    T = 10000
 
-    print(f"Setting up experiment with d={d}, |X|={num_arms}, T={T}")
-
-    # Generate synthetic data
     np.random.seed(42)
-    theta_star = np.random.randn(d)
-    theta_star /= np.linalg.norm(theta_star) # Normalize for stability
-
+    theta_star = np.zeros(d)
+    for i in range(d):
+        theta_star[i] = 10
+    # theta_star /= np.linalg.norm(theta_star)
     X = np.random.randn(num_arms, d)
-    # Normalize each arm vector
-    X /= np.linalg.norm(X, axis=1, keepdims=True)
-    
-    # Create environment
+    # for i in range(d):
+
+    # X /= np.linalg.norm(X, axis=1, keepdims=True)
+
     env = LinearBanditEnvironment(X, theta_star)
-    print(f"Optimal arm has expected reward: {env.optimal_reward:.4f}")
-
-    # Initialize and run LINNASH
-    linnash_algo = LinNash(X, T, nu=1.0)
-    print("\nRunning LINNASH...")
-    history = linnash_algo.run(env)
-    print("LINNASH finished.")
-
-    # --- Analysis ---
-    print("\n--- Results Analysis ---")
-    
-    # Calculate cumulative and Nash regret
-    expected_rewards_pulled = env.mean_rewards[history]
-    
-    cumulative_regret = np.sum(env.optimal_reward - expected_rewards_pulled)
-    print(f"Cumulative Regret: {cumulative_regret:.2f}")
-
-    # To avoid log(0), we use a small epsilon for zero-reward arms if any
-    log_rewards = np.log(np.maximum(1e-9, expected_rewards_pulled))
-    geometric_mean_reward = np.exp(np.mean(log_rewards))
-    
-    nash_regret = env.optimal_reward - geometric_mean_reward
-    print(f"Final Geometric Mean of Rewards: {geometric_mean_reward:.4f}")
-    print(f"Nash Regret: {nash_regret:.4f}")
-    
-    # You can use a library like matplotlib to plot the results
-    # For example, to plot the moving average of rewards:
-    try:
-        import pandas as pd
-        import matplotlib.pyplot as plt
-
-        print("\nPlotting moving average of rewards...")
-        rewards_s = pd.Series(expected_rewards_pulled)
-        moving_avg = rewards_s.rolling(window=T//50).mean()
-
-        plt.figure(figsize=(10, 6))
-        plt.plot(moving_avg)
-        plt.axhline(y=env.optimal_reward, color='r', linestyle='--', label=f'Optimal Reward ({env.optimal_reward:.2f})')
-        plt.title('1000-Round Moving Average of Expected Rewards (LINNASH)')
-        plt.xlabel('Rounds')
-        plt.ylabel('Expected Reward')
-        plt.legend()
-        plt.grid(True)
-        # plt.savefig("linnash_performance.png") # Uncomment to save the plot
-        plt.show()
-
-    except ImportError:
-        print("\nPlease install pandas and matplotlib (`pip install pandas matplotlib`) to see the plot.")
+    print("Running LINNASH (modified) ...")
+    regret_curve = simulate_linnash(env, X, T, num_trials=30, sigma2=1.0, regret_type="f")
+    plt.plot(regret_curve)
+    plt.xlabel("Rounds")
+    plt.ylabel("Arithmetic regret")
+    plt.show()
