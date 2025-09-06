@@ -255,6 +255,8 @@ class LinNash:
             rhs = (100 * self.d *  self.sigma2 * log_term) / denom \
                 + np.sqrt((t * self.sigma2 * log_term) / self.d)
             
+            # print(i, lhs, rhs)
+
             if lhs > rhs:
                 return False  # condition violated for some x
         return True
@@ -312,15 +314,15 @@ class LinNash:
             # print(f"yes {t}")
             theta_hat, V, sum_rX, history = self.pull_arms( A.tolist(), (U_alphas, U_indices), lambda_on_A, V, tilde_T, environment, sum_rX, history)
             vals = self.X @ theta_hat   # shape (num_arms,)
-            print("max(x^T theta_hat * tilde_T/3d) =", tilde_T*np.max(vals)/(3*self.d))
-            print("second term: ",np.sqrt(t*self.sigma2*self.log_term/self.d))
-            print("fienf : ", np.max(vals)-np.sqrt((6*self.d*self.sigma2*self.log_term)/max(1,t)))
+            # print("max(x^T theta_hat * tilde_T/3d) =", tilde_T*np.max(vals)/(3*self.d))
+            # print("second term: ",np.sqrt(t*self.sigma2*self.log_term/self.d))
+            # print("fienf : ", np.max(vals)-np.sqrt((6*self.d*self.sigma2*self.log_term)/max(1,t)))
             t += tilde_T
             tilde_T *= 2
 
         V_inv = np.linalg.pinv(V + 1e-9 * np.eye(self.d))
 
-
+        # print("Phase 1 here", t, len(history))
         est_rewards = self.X @ theta_hat
         lcb_vals = np.array([self._LCB(self.X[i], theta_hat, V_inv) for i in range(self.num_arms)])
         ucb_vals = np.array([self._UCB(self.X[i], theta_hat, V_inv) for i in range(self.num_arms)])
@@ -330,9 +332,9 @@ class LinNash:
         # # Phase II
         T_prime = max(1, int(round((2.0 / 3.0) * tilde_T)))
 
+        # print(total_rounds)
 
-
-        while total_rounds < self.T:
+        while t < self.T + 1:
             if len(X_tilde_indices) == 0:
                 # nothing left: pull best estimated arm for remaining budget
                 best = int(np.argmax(est_rewards))
@@ -340,11 +342,12 @@ class LinNash:
                 for _ in range(remaining):
                     r = environment.pull_arm(best)
                     history.append(best)
-                    total_rounds += 1
+                    t += 1
                     V += np.outer(self.X[best], self.X[best])
                     sum_rX += r * self.X[best]
                 break
 
+            # print(len(ghiuhisto)
             # Solve D-opt on X_tilde_indices
             lambdas_phase, indices_phase = self._solve_d_optimal_design(
                 X_tilde_indices,
@@ -352,15 +355,15 @@ class LinNash:
             )
             if lambdas_phase is None:
                 # fallback: uniformly sample active arms for remaining rounds
-                while total_rounds < self.T:
+                while t < self.T+1:
                     chosen = int(np.random.choice(X_tilde_indices))
                     r = environment.pull_arm(chosen)
                     history.append(chosen)
-                    total_rounds += 1
+                    t += 1
                     V += np.outer(self.X[chosen], self.X[chosen])
                     sum_rX += r * self.X[chosen]
                 break
-
+            # print(t)
             # ensure normalization and convert indices_phase to array of ints
             lambdas_phase = np.array(lambdas_phase, dtype=float)
             if lambdas_phase.sum() <= 0:
@@ -370,7 +373,7 @@ class LinNash:
             indices_phase = np.array(indices_phase, dtype=int)
 
             # For each arm in support, pull ceil(lambda_i * T') times (capped by remaining budget)
-            remaining_budget = self.T - total_rounds
+            remaining_budget = self.T+1 - t
             # compute planned pulls per support index, but we will cap as we go
             planned_pulls = [math.ceil(lambdas_phase[idx] * T_prime) for idx in range(len(indices_phase))]
 
@@ -384,11 +387,11 @@ class LinNash:
                 for _ in range(pulls):
                     r = environment.pull_arm(arm_global)
                     history.append(int(arm_global))
-                    total_rounds += 1
+                    t += 1
                     remaining_budget -= 1
                     V += np.outer(xvec, xvec)
                     sum_rX += r * xvec
-                    if total_rounds >= self.T:
+                    if t >= self.T:
                         break
 
             # Re-estimate theta_hat using cumulative V and sum_rX
@@ -405,6 +408,7 @@ class LinNash:
             # double T_prime for next phase (but not beyond remaining budget if you prefer)
             T_prime = min(self.T, int(2 * T_prime))
 
+        # print(t)
         # done Phase II; return history (plus optional stats)
         return history
         # T_prime = int(round((2.0 / 3.0) * tilde_T))
@@ -491,8 +495,10 @@ def simulate_linnash(env, X, T, num_trials=10, sigma2=1.0, regret_type="Nash"):
         total_rewards.append(rewards)
     total_rewards = np.array(total_rewards)
     expected_means = np.mean(total_rewards, axis=0)
+
     if regret_type == "Nash":
         cumsum_log = np.cumsum(np.log(np.maximum(expected_means, 1e-300)))
+        print(cumsum_log)
         inv_t = 1.0 / np.arange(1, T+1)
         geom_mean = np.exp(cumsum_log * inv_t)
         avg_regret = mu_star - geom_mean
@@ -512,15 +518,24 @@ if __name__ == '__main__':
     T = 10000
 
     np.random.seed(42)
-    theta_star = np.random.randn(d)
-    theta_star /= np.linalg.norm(theta_star)
+    theta_star = np.ones(d)*10
+
+
+
+    # theta_star /= np.linalg.norm(theta_star)
     X = np.random.randn(num_arms, d)
-    X /= np.linalg.norm(X, axis=1, keepdims=True)
+
+    # Ensure acute angle: project into positive half-space
+    for i in range(num_arms):
+        if np.dot(X[i], theta_star) <= 0:
+            X[i] *= -1   #
+
+    # X /= np.linalg.norm(X, axis=1, keepdims=True)
 
     env = LinearBanditEnvironment(X, theta_star)
     print("Running LINNASH (modified) ...")
-    regret_curve = simulate_linnash(env, X, T, num_trials=1, sigma2=1.0, regret_type="Arith")
+    regret_curve = simulate_linnash(env, X, T, num_trials=10, sigma2=1.0, regret_type="Nash")
     plt.plot(regret_curve)
     plt.xlabel("Rounds")
-    plt.ylabel("Arithmetic regret")
+    plt.ylabel("Nash regret")
     plt.show()
