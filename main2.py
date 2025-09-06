@@ -136,6 +136,7 @@ class LinNash:
             # fallback uniform
             alphas = np.ones(len(active_indices)) / len(active_indices)
             return alphas, active_indices
+        
     def pull_arms(self, A, U, lam, V, T_tilde, env, sum_rX=None, history=None, total_rounds=0):
         """
         Minimal implementation of Algorithm 1 (PullArms).
@@ -515,10 +516,10 @@ if __name__ == '__main__':
     # Small sanity run (reduce T for quick run)
     d = 10
     num_arms = 50
-    T = 10000
+    T = 1000000
 
     np.random.seed(42)
-    theta_star = np.ones(d)*10
+    theta_star = np.ones(d)
 
 
 
@@ -534,8 +535,16 @@ if __name__ == '__main__':
 
     env = LinearBanditEnvironment(X, theta_star)
     print("Running LINNASH (modified) ...")
-    regret_curve = simulate_linnash(env, X, T, num_trials=10, sigma2=1.0, regret_type="Nash")
-    plt.plot(regret_curve)
+    # regret_curve = simulate_linnash(env, X, T, num_trials=1, sigma2=1.0, regret_type="Avg")
+    cr = simulate_linnash(env, X, T, num_trials=10, sigma2=1.0, regret_type="Nash")
+    np.save("hhs.npy", cr)
+    regret_curve = np.load("hhb.npy")
+    # cr = np.load("hha.npy")
+    plt.plot(regret_curve, label= "Barman")
+    plt.plot(cr, label='Ours')
     plt.xlabel("Rounds")
     plt.ylabel("Nash regret")
+    plt.legend()
     plt.show()
+
+    

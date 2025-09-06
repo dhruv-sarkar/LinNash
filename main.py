@@ -28,7 +28,8 @@ class LinearBanditEnvironment:
         self.theta_star = theta_star
         self.num_arms, self.d = X.shape
         # Ensure mean rewards are in [0, 1] for Bernoulli rewards
-        self.mean_rewards = np.clip(self.X @ self.theta_star, 0, 1)
+        # print(self.X.shape, self.theta_star.shape)
+        self.mean_rewards = self.X @ self.theta_star
         self.optimal_arm_index = np.argmax(self.mean_rewards)
         self.optimal_reward = self.mean_rewards[self.optimal_arm_index]
 
@@ -43,7 +44,7 @@ class LinearBanditEnvironment:
             float: A reward (0 or 1).
         """
         mean = self.mean_rewards[arm_index]
-        return np.random.binomial(1, mean)
+        return np.random.normal(loc=mean, scale=1) 
 
 class LinNash:
     """
@@ -63,84 +64,106 @@ class LinNash:
         self.T = T
         self.nu = nu
         self.arm_indices = np.arange(self.num_arms)
+        self.log_term = np.log(self.T * self.num_arms)
 
-    def _solve_d_optimal_design(self, arm_set_indices):
+    def _solve_d_optimal_design(self, arm_set_indices, support_limit=None):
         """
-        Solves the D-optimal design problem using CVXPY.
-        Maximizes log(det(U)), where U = sum(lambda_x * x * x^T).
+        Solve D-optimal design maximize logdet(U) subject to sum(lambda)=1, lambda>=0.
+        If support_limit is provided, we will post-process to keep only top-k entries (practical).
+        Returns (lambdas_full, indices_full) where lambdas_full is aligned with arm_set_indices.
         """
         n_active = len(arm_set_indices)
         if n_active == 0:
             return None, None
-        
-        active_arms = self.X[arm_set_indices]
+
+        active_arms = self.X[arm_set_indices]  # shape (n_active, d)
         lambda_vars = cp.Variable(n_active, nonneg=True)
-        
-        U = cp.sum([lambda_vars[i] * np.outer(active_arms[i], active_arms[i]) for i in range(n_active)])
-        
+        # Build U = sum_i lambda_i x_i x_i^T
+        # CVXPY prefers expression building as sum of small matrices
+        U = sum([lambda_vars[i] * np.outer(active_arms[i], active_arms[i]) for i in range(n_active)])
         constraints = [cp.sum(lambda_vars) == 1]
-        objective = cp.Maximize(cp.log_det(U))
-        
+        objective = cp.Maximize(cp.log_det(U + 1e-9 * np.eye(self.d)))  # small regularizer for stability
+
         problem = cp.Problem(objective, constraints)
         try:
-            problem.solve()
+            problem.solve(solver=cp.SCS, verbose=False)  # SCS is robust; change if you prefer
             if problem.status in [cp.OPTIMAL, cp.OPTIMAL_INACCURATE]:
-                # Filter out negligible probabilities
-                lambdas = lambda_vars.value
-                lambdas[lambdas < 1e-6] = 0
-                lambdas /= np.sum(lambdas)
+                lambdas = np.array(lambda_vars.value).flatten()
+                lambdas[lambdas < 1e-9] = 0.0
+                if lambdas.sum() <= 0:
+                    return None, None
+                # Optionally enforce support size constraint by keeping top-k masses
+                if support_limit is not None and support_limit < n_active:
+                    k = min(n_active, support_limit)
+                    sorted_idx = np.argsort(-lambdas)
+                    keep = sorted_idx[:k]
+                    new_lambdas = np.zeros_like(lambdas)
+                    new_lambdas[keep] = lambdas[keep]
+                    if new_lambdas.sum() == 0:
+                        return None, None
+                    new_lambdas /= new_lambdas.sum()
+                    lambdas = new_lambdas
+                else:
+                    lambdas /= lambdas.sum()
                 return lambdas, arm_set_indices
             else:
                 return None, None
-        except (cp.error.SolverError, ValueError):
+        except Exception:
             return None, None
-
-    def _get_john_ellipsoid_dist(self):
+        
+    def _get_john_ellipsoid_dist(self, active_indices):
         """
-        Calculates a sampling distribution 'U' based on the center of the
-        John Ellipsoid of the convex hull of the arms.
-        This implementation finds the Chebyshev center as a practical approximation.
+        Approximate distribution U described in paper (Section 3.2) using the Chebyshev center
+        of the convex hull of the active arms. If geometry fails, fallback to uniform over active_indices.
         """
         try:
-            hull = ConvexHull(self.X)
-            hull_vertices = self.X[hull.vertices]
-            
-            # Find Chebyshev center (c, r) of the convex hull
-            # max r s.t. a_i^T * c + r * ||a_i|| <= b_i for each facet
+            X_active = self.X[active_indices]
+            if len(X_active) == 0:
+                return None, None
+            # If too few points or not full-dim, fallback to uniform
+            if len(X_active) <= self.d:
+                alphas = np.ones(len(active_indices)) / len(active_indices)
+                return alphas, active_indices
+
+            hull = ConvexHull(X_active)
+            hull_vertices = X_active[hull.vertices]
             A = hull.equations[:, :-1]
             b = -hull.equations[:, -1]
-            
-            c_obj = np.zeros(self.d + 1)
-            c_obj[-1] = -1  # Maximize r by minimizing -r
 
-            A_ub = np.hstack([A, np.linalg.norm(A, axis=1, keepdims=True)])
+            # Chebyshev center LP: maximize r s.t. A c + r ||a_i|| <= b_i
+            c_obj = np.zeros(self.d + 1)
+            c_obj[-1] = -1  # minimize -r
+            norms = np.linalg.norm(A, axis=1, keepdims=True)
+            A_ub = np.hstack([A, norms])
             b_ub = b
-            
-            res = linprog(c=c_obj, A_ub=A_ub, b_ub=b_ub, bounds=(None, None))
-            
-            if not res.success: return None, None
+
+            res = linprog(c=c_obj, A_ub=A_ub, b_ub=b_ub)
+            if not res.success:
+                # fallback uniform
+                alphas = np.ones(len(active_indices)) / len(active_indices)
+                return alphas, active_indices
             center = res.x[:-1]
 
-            # Express the center as a convex combination of hull vertices
-            # (Carathéodory's theorem). Solved via a feasibility LP.
-            Y = hull_vertices.T
+            # express center as convex comb. of hull vertices
+            Y = hull_vertices.T  # d x m
             c_feasibility = np.zeros(len(hull.vertices))
             A_eq = np.vstack([Y, np.ones(len(hull.vertices))])
             b_eq = np.hstack([center, 1])
-            
             res_alpha = linprog(c=c_feasibility, A_eq=A_eq, b_eq=b_eq, bounds=(0, None))
-            
-            if not res_alpha.success: return None, None
-            
+            if not res_alpha.success:
+                alphas = np.ones(len(active_indices)) / len(active_indices)
+                return alphas, active_indices
             alphas = res_alpha.x
-            alphas[alphas < 1e-6] = 0
-            alphas /= np.sum(alphas)
-            
-            return alphas, hull.vertices
+            alphas[alphas < 1e-9] = 0
+            alphas /= max(1e-12, alphas.sum())
 
+            # Need to map hull.vertices (indices wrt X_active) to global indices
+            global_indices = np.array(active_indices)[hull.vertices]
+            return alphas, global_indices
         except Exception:
-            # Fallback for geometric errors (e.g., if arms are not full-dimensional)
-            return None, None
+            # fallback uniform
+            alphas = np.ones(len(active_indices)) / len(active_indices)
+            return alphas, active_indices
 
 
     def _generate_arm_sequence(self, tilde_T):
@@ -148,52 +171,110 @@ class LinNash:
         Implements Algorithm 1 to generate the initial arm sequence for Part I.
         """
         # 1. D-optimal design distribution
-        lambda_d_opt, indices_d_opt = self._solve_d_optimal_design(self.arm_indices)
-        
-        # 2. John Ellipsoid center distribution
-        alphas_john, indices_john = self._get_john_ellipsoid_dist()
-        
-        # Fallback to uniform if geometric calculations fail
-        if alphas_john is None:
-            indices_john = self.arm_indices
-            alphas_john = np.ones(self.num_arms) / self.num_arms
 
-        # 3. Generate the sequence
-        arm_sequence = []
-        
-        support_d_opt = indices_d_opt[lambda_d_opt > 0]
-        lambda_support = lambda_d_opt[lambda_d_opt > 0]
-        
-        counts_d_opt = {arm_idx: 0 for arm_idx in support_d_opt}
-        min_pulls_d_opt = {
-            arm_idx: math.ceil(lam * tilde_T / 3) 
-            for arm_idx, lam in zip(support_d_opt, lambda_support)
-        }
-        
-        d_opt_arm_pool = list(support_d_opt)
-        d_opt_robin_idx = 0
+        support_limit = min(self.num_arms, self.d * (self.d + 1) // 2)
+
+        arms = []
+
+        lambdas0, lam_indices = self._solve_d_optimal_design(self.arm_indices, support_limit=support_limit)
+        if lambdas0 is None:
+            # fallback to uniform over all arms
+            lam_indices = self.arm_indices
+            lambdas0 = np.ones(len(lam_indices)) / len(lam_indices)
+
+
+        supp_mask = lambdas0 > 1e-9
+        A = np.array(lam_indices)[supp_mask]
+        lambda_on_A = np.array(lambdas0)[supp_mask]
+        if len(A) == 0:
+            # fallback: pick top-1 arm
+            A = np.array([int(lam_indices[np.argmax(lambdas0)])])
+            lambda_on_A = np.array([1.0])
+
+
+        U_alphas, U_indices = self._get_john_ellipsoid_dist(self.arm_indices)
+        if U_alphas is None:
+            U_indices = self.arm_indices
+            U_alphas = np.ones(len(U_indices)) / len(U_indices)
+
+
+        tilde_T = int(tilde_T)
+
+        # --- build lambda map aligned to global arm indices in A ---
+        if isinstance(lambda_on_A, dict):
+            lam_map = dict(lambda_on_A)
+        else:
+            lam_arr = np.array(lambda_on_A, dtype=float)
+            if lam_arr.ndim == 0:  # scalar
+                lam_map = {int(a): float(lam_arr) for a in A}
+            elif len(lam_arr) == len(A):
+                lam_map = {int(a): float(lam_arr[i]) for i, a in enumerate(A)}
+            else:
+                # fallback: uniform over A
+                lam_map = {int(a): 1.0 / max(1, len(A)) for a in A}
+
+
+        alphas, u_indices = U_alphas, U_indices
+        alphas = np.array(alphas, dtype=float)
+        u_indices = np.array(u_indices, dtype=int)
+        if alphas.sum() <= 0:
+            alphas = np.ones_like(alphas) / len(alphas)
+        else:
+            alphas = alphas / alphas.sum()
+
+        rr_order = list(A)            # dynamic RR list
+        counts = {int(a): 0 for a in A}
+        rr_ptr = 0
+
 
         for _ in range(tilde_T):
-            if np.random.rand() < 0.5 and len(d_opt_arm_pool) > 0:
-                # D/G-OPT arm selection (round-robin)
-                arm_idx = d_opt_arm_pool[d_opt_robin_idx]
-                arm_sequence.append(arm_idx)
-                counts_d_opt[arm_idx] += 1
-                
-                if counts_d_opt[arm_idx] >= min_pulls_d_opt[arm_idx]:
-                    d_opt_arm_pool.pop(d_opt_robin_idx)
-                
-                if len(d_opt_arm_pool) > 0:
-                    d_opt_robin_idx = (d_opt_robin_idx + 1) % len(d_opt_arm_pool)
-                else: # Reset if pool gets exhausted early
-                    d_opt_robin_idx = 0
+            # stop early if horizon reached
 
+            # coin flip
+            if random.random() < 0.5 or len(rr_order) == 0:
+                # SAMPLE from U
+                arm = int(np.random.choice(u_indices, p=alphas))
             else:
-                # SAMPLE-U (John Ellipsoid) arm selection
-                arm_idx = np.random.choice(indices_john, p=alphas_john)
-                arm_sequence.append(arm_idx)
-                
-        return arm_sequence
+                # D: pick next in round-robin
+                arm = int(rr_order[rr_ptr % len(rr_order)])
+                rr_ptr = (rr_ptr + 1) % max(1, len(rr_order))
+                counts[arm] = counts.get(arm, 0) + 1
+
+                # threshold check: ceil(lambda_arm * T_tilde / 3)
+                lambda_arm = lam_map.get(arm, 0.0)
+                thresh = math.ceil(lambda_arm * float(tilde_T) / 3.0)
+                if counts[arm] >= thresh:
+                    # remove from rr_order if present
+                    try:
+                        pos = rr_order.index(arm)
+                        rr_order.pop(pos)
+                        # fix pointer to remain valid
+                        if len(rr_order) == 0:
+                            rr_ptr = 0
+                        else:
+                            rr_ptr = rr_ptr % len(rr_order)
+                    except ValueError:
+                        pass
+
+            # pull, update stats
+            arms.append(arm)
+
+        return arms
+
+    def _LCB(self, x_vec, phi, t):
+        inner = float(x_vec @ phi)
+        if inner <= 0:
+            return -np.inf
+        width = 6.0 * math.sqrt((inner * self.nu * self.d * self.log_term) / max(1, t))
+        return inner - width
+
+    def _UCB(self, x_vec, phi, t):
+        inner = float(x_vec @ phi)
+        if inner <= 0:
+            return np.inf
+        width = 6.0 * math.sqrt((inner * self.nu * self.d * self.log_term) / max(1, t))
+        return inner + width
+
 
     def run(self, environment):
         """
@@ -202,22 +283,20 @@ class LinNash:
         Returns:
             list: A list of arm indices pulled in each round.
         """
+        log_term = np.log(self.T * self.num_arms)
         history = []
         total_rounds_played = 0
+        V = np.zeros((self.d, self.d))
+        sum_rX = np.zeros(self.d)          # maintain cumulative sum_rX across phases
+        tilde_T = int(3 * np.sqrt(self.T * self.d * self.nu * log_term))
 
         # --- Part I ---
-        log_term = np.log(self.T * self.num_arms)
-        tilde_T = int(3 * np.sqrt(self.T * self.d * self.nu * log_term))
-        tilde_T = min(tilde_T, self.T)
-        
-        V = np.zeros((self.d, self.d))
-        sum_rX = np.zeros(self.d)
 
-        # Generate arm sequence for the first tilde_T rounds
-        arm_sequence_part1 = self._generate_arm_sequence(tilde_T)
+
+        arms = self._generate_arm_sequence(tilde_T)        
         
         for t in range(tilde_T):
-            arm_idx = arm_sequence_part1[t]
+            arm_idx = arms[t]
             arm_vec = self.X[arm_idx]
             reward = environment.pull_arm(arm_idx)
             
@@ -227,113 +306,112 @@ class LinNash:
         
         total_rounds_played += tilde_T
         
-        # Estimate and eliminate
-        try:
-            V_inv = np.linalg.inv(V)
-            theta_hat = V_inv @ sum_rX
-        except np.linalg.LinAlgError:
-            # Fallback if V is singular
-            theta_hat = np.linalg.pinv(V) @ sum_rX
-
-        # Confidence bound calculation
         t_prime_part1 = tilde_T / 3
-        
+
+        theta_hat = np.linalg.inv(V) @ sum_rX
         est_rewards = self.X @ theta_hat
-        # Clip estimated rewards at a small positive value to avoid math errors in sqrt
-        est_rewards_clipped = np.maximum(1e-9, est_rewards)
+        lcb_vals = np.array([self._LCB(self.X[i], theta_hat, t_prime_part1) for i in range(self.num_arms)])
+        ucb_vals = np.array([self._UCB(self.X[i], theta_hat, t_prime_part1) for i in range(self.num_arms)])
+        max_lcb = np.max(lcb_vals)
+        X_tilde_indices = np.where(ucb_vals >= max_lcb)[0]
 
-        confidence_widths = 6 * np.sqrt(
-            (est_rewards_clipped * self.nu * self.d * log_term) / t_prime_part1
-        )
-        lncb = est_rewards - confidence_widths
-        uncb = est_rewards + confidence_widths
+        T_prime = max(1, int(round((2.0 / 3.0) * tilde_T)))
 
-        # Elimination
-        max_lncb = np.max(lncb)
-        active_arm_indices = self.arm_indices[uncb >= max_lncb]
-        
-        # --- Part II ---
-        T_prime = (2 / 3) * tilde_T
 
+        # print(total_rounds_played, len(history))
         while total_rounds_played < self.T:
-            if len(active_arm_indices) <= 1:
-                # If one or zero arms are left, play the best one
-                if len(active_arm_indices) == 1:
-                    arm_idx_to_play = active_arm_indices[0]
-                else: # Fallback if all arms are eliminated
-                    arm_idx_to_play = np.random.choice(self.arm_indices)
-                
-                remaining_rounds = self.T - total_rounds_played
-                for _ in range(remaining_rounds):
-                    history.append(arm_idx_to_play)
+            if len(X_tilde_indices) == 0:
+                # nothing left: pull best estimated arm for remaining budget
+                best = int(np.argmax(est_rewards))
+                remaining = self.T - total_rounds_played
+                for _ in range(remaining):
+                    r = environment.pull_arm(best)
+                    history.append(best)
+                    total_rounds_played += 1
+                    V += np.outer(self.X[best], self.X[best])
+                    sum_rX += r * self.X[best]
                 break
-            
-            # New phase
-            V_phase = np.zeros((self.d, self.d))
-            s_phase = np.zeros(self.d)
-            
-            lambdas, indices = self._solve_d_optimal_design(active_arm_indices)
-            
-            if lambdas is None: # Fallback if solver fails
-                arm_idx = np.random.choice(active_arm_indices)
-                reward = environment.pull_arm(arm_idx)
-                history.append(arm_idx)
-                total_rounds_played += 1
-                continue
 
-            # Pull arms according to D-optimal design
-            rounds_this_phase = 0
-            for i, arm_idx in enumerate(indices):
-                num_pulls = math.ceil(lambdas[i] * T_prime)
-                if total_rounds_played + num_pulls > self.T:
-                    num_pulls = self.T - total_rounds_played
-                
-                arm_vec = self.X[arm_idx]
-                rewards_sum = 0
-                for _ in range(num_pulls):
-                    rewards_sum += environment.pull_arm(arm_idx)
-                    history.append(arm_idx)
-
-                V_phase += num_pulls * np.outer(arm_vec, arm_vec)
-                s_phase += rewards_sum * arm_vec
-                rounds_this_phase += num_pulls
-                total_rounds_played += num_pulls
-                
-                if total_rounds_played >= self.T:
-                    break
-
-            # Estimate and eliminate again
-            try:
-                theta_hat = np.linalg.pinv(V_phase) @ s_phase
-            except np.linalg.LinAlgError:
-                theta_hat = np.zeros(self.d) # Should not happen if design is good
-            
-            est_rewards = self.X @ theta_hat
-            est_rewards_clipped = np.maximum(1e-9, est_rewards)
-            
-            confidence_widths = 6 * np.sqrt(
-                (est_rewards_clipped * self.nu * self.d * log_term) / T_prime
+            # print(len(ghiuhisto)
+            # Solve D-opt on X_tilde_indices
+            lambdas_phase, indices_phase = self._solve_d_optimal_design(
+                X_tilde_indices,
+                support_limit=min(len(X_tilde_indices), self.d*(self.d+1)//2)
             )
-            lncb = est_rewards - confidence_widths
-            uncb = est_rewards + confidence_widths
+            # print(total_rounds_played)
+            if lambdas_phase is None:
+                # fallback: uniformly sample active arms for remaining rounds
+                while total_rounds_played < self.T:
+                    chosen = int(np.random.choice(X_tilde_indices))
+                    r = environment.pull_arm(chosen)
+                    history.append(chosen)
+                    total_rounds_played += 1
+                    V += np.outer(self.X[chosen], self.X[chosen])
+                    sum_rX += r * self.X[chosen]
+                break
+            # print(t)
+            # ensure normalization and convert indices_phase to array of ints
+            lambdas_phase = np.array(lambdas_phase, dtype=float)
+            if lambdas_phase.sum() <= 0:
+                lambdas_phase = np.ones_like(lambdas_phase) / len(lambdas_phase)
+            else:
+                lambdas_phase = lambdas_phase / lambdas_phase.sum()
+            indices_phase = np.array(indices_phase, dtype=int)
 
-            max_lncb = np.max(lncb[active_arm_indices])
-            active_arm_indices = active_arm_indices[uncb[active_arm_indices] >= max_lncb]
-            
-            # Update for next phase
-            T_prime *= 2
+            # For each arm in support, pull ceil(lambda_i * T') times (capped by remaining budget)
+            remaining_budget = self.T - total_rounds_played
+            # compute planned pulls per support index, but we will cap as we go
+            planned_pulls = [math.ceil(lambdas_phase[idx] * T_prime) for idx in range(len(indices_phase))]
 
+            for idx_local, arm_global in enumerate(indices_phase):
+                # print(total_rounds_played)
+                if remaining_budget <= 0:
+                    break
+                pulls = min(planned_pulls[idx_local], remaining_budget)
+                if pulls <= 0:
+                    continue
+                xvec = self.X[arm_global]
+                for _ in range(pulls):
+                    r = environment.pull_arm(arm_global)
+                    history.append(int(arm_global))
+                    total_rounds_played += 1
+                    remaining_budget -= 1
+                    V += np.outer(xvec, xvec)
+                    sum_rX += r * xvec
+                    if total_rounds_played >= self.T:
+                        break
+
+            # Re-estimate theta_hat using cumulative V and sum_rX
+            V_inv = np.linalg.pinv(V + 1e-9 * np.eye(self.d))
+            theta_hat = V_inv @ sum_rX
+            est_rewards = self.X @ theta_hat
+
+            # recompute LCB/UCB and shrink X_tilde
+            lcb_vals = np.array([self._LCB(self.X[i], theta_hat, T_prime) for i in range(self.num_arms)])
+            ucb_vals = np.array([self._UCB(self.X[i], theta_hat, T_prime) for i in range(self.num_arms)])
+            max_lcb = np.max(lcb_vals)
+            X_tilde_indices = np.where(ucb_vals >= max_lcb)[0]
+
+            # double T_prime for next phase (but not beyond remaining budget if you prefer)
+            T_prime = min(self.T, int(2 * T_prime))
+
+        # print(t)
+        # done Phase II; return history (plus optional stats)
         return history
     
 
 def simulate_linnash(env, X, T, num_trials=10, sigma2=1.0, regret_type="Nash"):
     mu_star = np.max(env.mean_rewards)
     total_rewards = []
-    for _ in tqdm(range(num_trials), desc="LINNASH Trials"):
-        algo = LinNash(X, T, nu=1)
-        history = algo.run(env)
-        rewards = env.mean_rewards[history]
-        total_rewards.append(rewards)
+    try:
+        for _ in tqdm(range(num_trials), desc="LINNASH Trials"):
+            algo = LinNash(X, T, nu=2)
+            history = algo.run(env)
+            rewards = env.mean_rewards[history]
+            total_rewards.append(rewards)
+    except KeyboardInterrupt:
+        print("Interrupted by user.")
+
 
     total_rewards = np.array(total_rewards)
     expected_means = np.mean(total_rewards, axis=0)
@@ -357,22 +435,26 @@ if __name__ == '__main__':
     # Small sanity run (reduce T for quick run)
     d = 10
     num_arms = 50
-    T = 10000
+    T = 1000000
 
     np.random.seed(42)
-    theta_star = np.zeros(d)
-    for i in range(d):
-        theta_star[i] = 10
+    theta_star = np.ones(d)
     # theta_star /= np.linalg.norm(theta_star)
     X = np.random.randn(num_arms, d)
+
+    # Ensure acute angle: project into positive half-space
+    for i in range(num_arms):
+        if np.dot(X[i], theta_star) <= 0:
+            X[i] *= -1   #
     # for i in range(d):
 
     # X /= np.linalg.norm(X, axis=1, keepdims=True)
 
     env = LinearBanditEnvironment(X, theta_star)
     print("Running LINNASH (modified) ...")
-    regret_curve = simulate_linnash(env, X, T, num_trials=30, sigma2=1.0, regret_type="f")
+    regret_curve = simulate_linnash(env, X, T, num_trials=50, sigma2=1.0, regret_type="Nash")
+    np.save("hhb.npy", regret_curve)
     plt.plot(regret_curve)
     plt.xlabel("Rounds")
-    plt.ylabel("Arithmetic regret")
+    plt.ylabel("Nash regret")
     plt.show()
